@@ -13,6 +13,20 @@ trait AsyncIterator {
 
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()>;
 
+    fn then<F, Fut>(self, f: F) -> Then<Self, F, Fut>
+    where
+        Self: Sized,
+        F: FnMut(Self::Item) -> Fut,
+        Fut: Future,
+    {
+        Then {
+            stream: Some(self),
+            f,
+            fut: None,
+            output: None,
+        }
+    }
+
     fn merge<S2>(self, other: S2) -> Merge<Self, S2>
     where
         Self: Sized,
@@ -79,6 +93,85 @@ impl<Fut: Future> AsyncIterator for Once<Fut> {
             return Poll::Ready(());
         }
         this.maybe_done.poll(cx)
+    }
+}
+
+pin_project! {
+    #[must_use]
+    struct Then<S, F, Fut>
+    where
+        S: AsyncIterator,
+        F: FnMut(S::Item) -> Fut,
+        Fut: Future,
+    {
+        #[pin]
+        stream: Option<S>,
+        f: F,
+        #[pin]
+        fut: Option<Fut>,
+        output: Option<Fut::Output>,
+    }
+}
+
+impl<S, F, Fut> AsyncIterator for Then<S, F, Fut>
+where
+    S: AsyncIterator,
+    F: FnMut(S::Item) -> Fut,
+    Fut: Future,
+{
+    type Item = Fut::Output;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Fut::Output>> {
+        _ = self.as_mut().poll_progress(cx);
+        let this = self.project();
+        if let Some(output) = this.output.take() {
+            Poll::Ready(Some(output))
+        } else if this.stream.is_none() && this.fut.is_none() {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut this = self.project();
+        debug_assert!(this.fut.is_none() || this.output.is_none());
+        let mut is_pending = false;
+
+        if let Some(stream) = this.stream.as_mut().as_pin_mut() {
+            if this.fut.is_none() && this.output.is_none() {
+                match stream.poll_next(cx) {
+                    Poll::Ready(Some(item)) => {
+                        let fut = (this.f)(item);
+                        this.fut.set(Some(fut));
+                    }
+                    Poll::Ready(None) => {
+                        this.stream.set(None);
+                        return Poll::Ready(());
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            } else if stream.poll_progress(cx).is_pending() {
+                is_pending = true;
+            }
+        }
+
+        if let Some(fut) = this.fut.as_mut().as_pin_mut() {
+            debug_assert!(this.output.is_none());
+            match fut.poll(cx) {
+                Poll::Ready(output) => {
+                    this.fut.set(None);
+                    *this.output = Some(output);
+                }
+                Poll::Pending => is_pending = true,
+            }
+        }
+
+        if is_pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
     }
 }
 
@@ -173,9 +266,7 @@ where
                         }
                         Poll::Ready(None) => {
                             this.stream.set(None);
-                            if this.fut.is_none() {
-                                return Poll::Ready(());
-                            }
+                            return Poll::Ready(());
                         }
                         // `this.fut` is `None` here, so we short-circuit.
                         Poll::Pending => return Poll::Pending,
@@ -215,10 +306,11 @@ async fn main() {
     let stream2 = once(foo(2));
     let merged = stream1.merge(stream2);
     merged
+        .then(async |i| foo(10 * i).await)
         .for_each(async |item| {
-            println!("Got {:?}, calling foo(3)...", item);
-            foo(3).await;
-            println!("...foo(3) finished");
+            println!("Got {:?}, calling foo(999)...", item);
+            foo(999).await;
+            println!("...foo(999) finished");
         })
         .await;
 }
