@@ -1,5 +1,6 @@
 use pin_project_lite::pin_project;
 use std::future::Future;
+use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::Mutex;
@@ -36,40 +37,62 @@ trait AsyncIterator {
     }
 }
 
-fn once<Fut>(future: Fut) -> Once<Fut> {
-    Once {
-        future: Some(future),
-    }
+fn once<Fut>(future: Fut) -> Once<Fut>
+where
+    Fut: Future,
+{
+    Once::Future(future)
 }
 
-pin_project! {
-    #[must_use]
-    struct Once<Fut> {
-        #[pin]
-        future: Option<Fut>,
-    }
+#[must_use]
+enum Once<Fut>
+where
+    Fut: Future,
+{
+    Future(Fut), // pinned
+    Output(Fut::Output),
+    Done,
 }
 
 impl<Fut: Future> AsyncIterator for Once<Fut> {
     type Item = Fut::Output;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-        if let Some(future) = this.future.as_mut().as_pin_mut() {
-            match future.poll(cx) {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let self_mut = unsafe { self.as_mut().get_unchecked_mut() };
+        if let Once::Future(future) = self_mut {
+            let pin_future = unsafe { Pin::new_unchecked(future) };
+            match pin_future.poll(cx) {
                 Poll::Ready(output) => {
-                    this.future.set(None);
-                    Poll::Ready(Some(output))
+                    self.set(Once::Done);
+                    return Poll::Ready(Some(output));
                 }
-                Poll::Pending => Poll::Pending,
+                Poll::Pending => return Poll::Pending,
             }
+        }
+        // We don't have a future anymore, but if `poll_progress` has been called, we might have an
+        // output ready.
+        if let Once::Output(output) = mem::replace(self_mut, Once::Done) {
+            Poll::Ready(Some(output))
         } else {
             Poll::Ready(None)
         }
     }
 
-    fn poll_progress(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-        Poll::Ready(())
+    fn poll_progress(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let self_mut = unsafe { self.as_mut().get_unchecked_mut() };
+        match self_mut {
+            Once::Future(future) => {
+                let pin_future = unsafe { Pin::new_unchecked(future) };
+                match pin_future.poll(cx) {
+                    Poll::Ready(output) => {
+                        self.set(Once::Output(output));
+                        Poll::Ready(())
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            _ => Poll::Ready(()),
+        }
     }
 }
 
@@ -114,17 +137,9 @@ where
     }
 
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let mut this = self.project();
-        let poll1 = this
-            .stream1
-            .as_mut()
-            .as_pin_mut()
-            .map(|s| s.poll_progress(cx));
-        let poll2 = this
-            .stream2
-            .as_mut()
-            .as_pin_mut()
-            .map(|s| s.poll_progress(cx));
+        let this = self.project();
+        let poll1 = this.stream1.as_pin_mut().map(|s| s.poll_progress(cx));
+        let poll2 = this.stream2.as_pin_mut().map(|s| s.poll_progress(cx));
         if matches!(poll1, Some(Poll::Pending)) || matches!(poll2, Some(Poll::Pending)) {
             Poll::Pending
         } else {
