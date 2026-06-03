@@ -284,40 +284,45 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut this = self.project();
         loop {
-            if let Some(stream) = this.stream.as_mut().as_pin_mut() {
-                if this.fut.is_none() {
-                    match stream.poll_next(cx) {
-                        Poll::Ready(Some(item)) => {
-                            let fut = (this.f)(item);
-                            this.fut.set(Some(fut));
-                            // If the new future is ready on its first poll below, we'll loop
-                            // around and try to make another one. If not, we'll loop around and
-                            // poll_progress.
-                        }
-                        Poll::Ready(None) => {
-                            this.stream.set(None);
-                            return Poll::Ready(());
-                        }
-                        // `this.fut` is `None` here, so we short-circuit.
-                        Poll::Pending => return Poll::Pending,
+            // If we need a new future, try to get one.
+            if this.fut.is_none()
+                && let Some(stream) = this.stream.as_mut().as_pin_mut()
+            {
+                match stream.poll_next(cx) {
+                    Poll::Ready(Some(item)) => {
+                        let fut = (this.f)(item);
+                        this.fut.set(Some(fut));
+                        // If the new future is ready on its first poll below, we'll loop
+                        // around and try to make another one. If not, we'll poll_progress before
+                        // we yield.
                     }
-                } else {
+                    Poll::Ready(None) => {
+                        this.stream.set(None);
+                        return Poll::Ready(());
+                    }
+                    // `this.fut` is `None` here, so short-circuit.
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            // If we have a future, try to finish it.
+            if let Some(fut) = this.fut.as_mut().as_pin_mut() {
+                if fut.poll(cx).is_ready() {
+                    this.fut.set(None);
+                    if this.stream.is_none() {
+                        return Poll::Ready(());
+                    } else {
+                        // Loop around and try to get another future.
+                        continue;
+                    }
+                } else if let Some(stream) = this.stream.as_mut().as_pin_mut() {
+                    // If the future is pending, let the stream make progress concurrently.
                     _ = stream.poll_progress(cx);
                 }
             }
 
-            if let Some(fut) = this.fut.as_mut().as_pin_mut() {
-                match fut.poll(cx) {
-                    Poll::Ready(()) => {
-                        this.fut.set(None);
-                        if this.stream.is_none() {
-                            return Poll::Ready(());
-                        }
-                        // Loop around. If the stream is still alive, we'll run another future.
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
+            debug_assert!(this.fut.is_some() || this.stream.is_some());
+            return Poll::Pending;
         }
     }
 }
