@@ -9,9 +9,16 @@ use tokio::time::{Duration, Instant, sleep};
 trait AsyncIterator {
     type Item;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>>;
 
-    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()>;
+    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()>;
+
+    fn fuse(self) -> Fuse<Self>
+    where
+        Self: Sized,
+    {
+        Fuse { stream: Some(self) }
+    }
 
     fn then<F, Fut>(self, f: F) -> Then<Self, F, Fut>
     where
@@ -20,7 +27,7 @@ trait AsyncIterator {
         Fut: Future,
     {
         Then {
-            stream: Some(self),
+            stream: self.fuse(),
             f,
             fut: MaybeDone::Gone,
         }
@@ -29,10 +36,11 @@ trait AsyncIterator {
     fn merge<S2>(self, other: S2) -> Merge<Self, S2>
     where
         Self: Sized,
+        S2: AsyncIterator<Item = Self::Item>,
     {
         Merge {
-            stream1: Some(self),
-            stream2: Some(other),
+            stream1: self.fuse(),
+            stream2: other.fuse(),
         }
     }
 
@@ -43,7 +51,7 @@ trait AsyncIterator {
         Fut: Future<Output = ()>,
     {
         ForEach {
-            stream: Some(self),
+            stream: self.fuse(),
             f,
             fut: None,
         }
@@ -73,9 +81,9 @@ pin_project! {
 impl<Fut: Future> AsyncIterator for Once<Fut> {
     type Item = Fut::Output;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
-        if let MaybeDone::Gone = &*this.maybe_done {
+        if this.maybe_done.is_gone() {
             return Poll::Ready(None);
         }
         _ = this.maybe_done.as_mut().poll(cx);
@@ -86,7 +94,7 @@ impl<Fut: Future> AsyncIterator for Once<Fut> {
         }
     }
 
-    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         let this = self.project();
         if let MaybeDone::Gone = &*this.maybe_done {
             return Poll::Ready(());
@@ -116,12 +124,55 @@ where
 {
     type Item = I::Item;
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Option<Self::Item>> {
         Poll::Ready(self.iter.next())
     }
 
-    fn poll_progress(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_progress(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<()> {
         Poll::Ready(())
+    }
+}
+
+pin_project! {
+    #[must_use]
+    struct Fuse<S> {
+        #[pin]
+        stream: Option<S>,
+    }
+}
+
+impl<S> Fuse<S> {
+    fn is_done(&self) -> bool {
+        self.stream.is_none()
+    }
+}
+
+impl<S> AsyncIterator for Fuse<S>
+where
+    S: AsyncIterator,
+{
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<S::Item>> {
+        let mut this = self.project();
+        if let Some(stream) = this.stream.as_mut().as_pin_mut() {
+            let poll = stream.poll_next(cx);
+            if let Poll::Ready(None) = poll {
+                this.stream.set(None);
+            }
+            poll
+        } else {
+            Poll::Ready(None)
+        }
+    }
+
+    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
+        let this = self.project();
+        if let Some(stream) = this.stream.as_pin_mut() {
+            stream.poll_progress(cx)
+        } else {
+            Poll::Ready(())
+        }
     }
 }
 
@@ -134,7 +185,7 @@ pin_project! {
         Fut: Future,
     {
         #[pin]
-        stream: Option<S>,
+        stream: Fuse<S>,
         f: F,
         #[pin]
         fut: MaybeDone<Fut>,
@@ -149,41 +200,38 @@ where
 {
     type Item = Fut::Output;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Fut::Output>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Fut::Output>> {
         _ = self.as_mut().poll_progress(cx);
         let mut this = self.project();
         if let Some(output) = this.fut.as_mut().take_output() {
             Poll::Ready(Some(output))
-        } else if this.stream.is_none() && matches!(&*this.fut, MaybeDone::Gone) {
+        } else if this.stream.is_done() && this.fut.is_gone() {
             Poll::Ready(None)
         } else {
             Poll::Pending
         }
     }
 
-    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         let mut this = self.project();
         let mut is_pending = false;
 
-        if let Some(stream) = this.stream.as_mut().as_pin_mut() {
-            if matches!(&*this.fut, MaybeDone::Gone) {
-                match stream.poll_next(cx) {
-                    Poll::Ready(Some(item)) => {
-                        let fut = (this.f)(item);
-                        this.fut.set(MaybeDone::Future(fut));
-                    }
-                    Poll::Ready(None) => {
-                        this.stream.set(None);
-                        return Poll::Ready(());
-                    }
-                    Poll::Pending => return Poll::Pending,
+        if this.fut.is_gone() {
+            match this.stream.poll_next(cx) {
+                Poll::Ready(Some(item)) => {
+                    let fut = (this.f)(item);
+                    this.fut.set(MaybeDone::Future(fut));
                 }
-            } else if stream.poll_progress(cx).is_pending() {
-                is_pending = true;
+                Poll::Ready(None) => {
+                    return Poll::Ready(());
+                }
+                Poll::Pending => return Poll::Pending,
             }
+        } else if this.stream.poll_progress(cx).is_pending() {
+            is_pending = true;
         }
 
-        if matches!(&*this.fut, MaybeDone::Future(_)) {
+        if !this.fut.is_gone() {
             if this.fut.poll(cx).is_pending() {
                 is_pending = true;
             }
@@ -201,9 +249,9 @@ pin_project! {
     #[must_use]
     struct Merge<S1, S2> {
         #[pin]
-        stream1: Option<S1>,
+        stream1: Fuse<S1>,
         #[pin]
-        stream2: Option<S2>,
+        stream2: Fuse<S2>,
     }
 }
 
@@ -214,34 +262,26 @@ where
 {
     type Item = S1::Item;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
-        if let Some(stream1) = this.stream1.as_mut().as_pin_mut() {
-            match stream1.poll_next(cx) {
-                Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
-                Poll::Ready(None) => this.stream1.set(None),
-                Poll::Pending => {}
-            }
+        if let Poll::Ready(Some(item)) = this.stream1.as_mut().poll_next(cx) {
+            return Poll::Ready(Some(item));
         }
-        if let Some(stream2) = this.stream2.as_mut().as_pin_mut() {
-            match stream2.poll_next(cx) {
-                Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
-                Poll::Ready(None) => this.stream2.set(None),
-                Poll::Pending => {}
-            }
+        if let Poll::Ready(Some(item)) = this.stream2.as_mut().poll_next(cx) {
+            return Poll::Ready(Some(item));
         }
-        if this.stream1.is_none() && this.stream2.is_none() {
+        if this.stream1.is_done() && this.stream2.is_done() {
             Poll::Ready(None)
         } else {
             Poll::Pending
         }
     }
 
-    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         let this = self.project();
-        let poll1 = this.stream1.as_pin_mut().map(|s| s.poll_progress(cx));
-        let poll2 = this.stream2.as_pin_mut().map(|s| s.poll_progress(cx));
-        if matches!(poll1, Some(Poll::Pending)) || matches!(poll2, Some(Poll::Pending)) {
+        let poll1 = this.stream1.poll_progress(cx);
+        let poll2 = this.stream2.poll_progress(cx);
+        if poll1.is_pending() || poll2.is_pending() {
             Poll::Pending
         } else {
             Poll::Ready(())
@@ -258,7 +298,7 @@ pin_project! {
         Fut: Future<Output = ()>,
     {
         #[pin]
-        stream: Option<S>,
+        stream: Fuse<S>,
         f: F,
         #[pin]
         fut: Option<Fut>,
@@ -273,26 +313,20 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         let mut this = self.project();
         loop {
             // If we need a new future, try to get one.
-            if this.fut.is_none()
-                && let Some(stream) = this.stream.as_mut().as_pin_mut()
-            {
-                match stream.poll_next(cx) {
+            if this.fut.is_none() {
+                match this.stream.as_mut().poll_next(cx) {
                     Poll::Ready(Some(item)) => {
                         let fut = (this.f)(item);
                         this.fut.set(Some(fut));
-                        // If the new future is ready on its first poll below, we'll loop
-                        // around and try to make another one. If not, we'll poll_progress before
-                        // we yield.
+                        // If the new future is ready on its first poll below, we'll loop around
+                        // and try to make another one. If not, we'll poll_progress before we
+                        // yield.
                     }
-                    Poll::Ready(None) => {
-                        this.stream.set(None);
-                        return Poll::Ready(());
-                    }
-                    // `this.fut` is `None` here, so short-circuit.
+                    Poll::Ready(None) => return Poll::Ready(()),
                     Poll::Pending => return Poll::Pending,
                 }
             }
@@ -301,21 +335,31 @@ where
             if let Some(fut) = this.fut.as_mut().as_pin_mut() {
                 if fut.poll(cx).is_ready() {
                     this.fut.set(None);
-                    if this.stream.is_none() {
+                    if this.stream.is_done() {
                         return Poll::Ready(());
                     } else {
                         // Loop around and try to get another future.
                         continue;
                     }
-                } else if let Some(stream) = this.stream.as_mut().as_pin_mut() {
+                } else {
                     // If the future is pending, let the stream make progress concurrently.
-                    _ = stream.poll_progress(cx);
+                    _ = this.stream.as_mut().poll_progress(cx);
                 }
             }
 
-            debug_assert!(this.fut.is_some() || this.stream.is_some());
+            debug_assert!(this.fut.is_some() || !this.stream.is_done());
             return Poll::Pending;
         }
+    }
+}
+
+trait IsGoneExt {
+    fn is_gone(&self) -> bool;
+}
+
+impl<Fut: Future> IsGoneExt for MaybeDone<Fut> {
+    fn is_gone(&self) -> bool {
+        matches!(self, MaybeDone::Gone)
     }
 }
 
