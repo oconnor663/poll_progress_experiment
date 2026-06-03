@@ -385,7 +385,7 @@ async fn main() {
 
     println!("-----");
 
-    let start_time = Instant::now();
+    let start = Instant::now();
     iter(0..10)
         .then(async |x| {
             sleep(Duration::from_millis(100)).await;
@@ -393,8 +393,34 @@ async fn main() {
         })
         .for_each(async |x| {
             sleep(Duration::from_millis(100)).await;
-            let elapsed = Instant::elapsed(&start_time).as_secs_f32();
+            let elapsed = Instant::elapsed(&start).as_secs_f32();
             println!("[{elapsed:.3}s] {x}");
+        })
+        .await;
+
+    println!("-----");
+
+    async fn slow_push(mut s: String, c: char) -> String {
+        sleep(Duration::from_millis(100)).await;
+        s.push(c);
+        s
+    }
+
+    let start = Instant::now();
+    iter((0..10).map(|i| i.to_string()))
+        .then(|s| slow_push(s, 'a'))
+        .then(|s| slow_push(s, 'b'))
+        .then(|s| slow_push(s, 'c'))
+        .then(|s| slow_push(s, 'd'))
+        .then(|s| slow_push(s, 'e'))
+        .then(|s| slow_push(s, 'f'))
+        .then(|s| slow_push(s, 'g'))
+        .then(|s| slow_push(s, 'h'))
+        .then(|s| slow_push(s, 'i'))
+        .then(|s| slow_push(s, 'j'))
+        .for_each(async |x| {
+            let elapsed = Instant::elapsed(&start).as_secs_f32();
+            println!("[{elapsed:6.3}s] {x}");
         })
         .await;
 }
