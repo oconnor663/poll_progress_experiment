@@ -316,7 +316,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         let mut this = self.project();
         loop {
-            // If we need a new future, try to get one.
+            // If we need a new future, try to get one. If we can't get one, short-circuit.
             if this.fut.is_none() {
                 match this.stream.as_mut().poll_next(cx) {
                     Poll::Ready(Some(item)) => {
@@ -331,20 +331,18 @@ where
                 }
             }
 
-            // If we have a future, try to finish it.
-            if let Some(fut) = this.fut.as_mut().as_pin_mut() {
-                if fut.poll(cx).is_ready() {
-                    this.fut.set(None);
-                    if this.stream.is_done() {
-                        return Poll::Ready(());
-                    } else {
-                        // Loop around and try to get another future.
-                        continue;
-                    }
+            // We have a future. Try to finish it.
+            if this.fut.as_mut().as_pin_mut().unwrap().poll(cx).is_ready() {
+                this.fut.set(None);
+                if this.stream.is_done() {
+                    return Poll::Ready(());
                 } else {
-                    // If the future is pending, let the stream make progress concurrently.
-                    _ = this.stream.as_mut().poll_progress(cx);
+                    // Loop around and try to get another future.
+                    continue;
                 }
+            } else {
+                // If the future is pending, let the stream make progress concurrently.
+                _ = this.stream.as_mut().poll_progress(cx);
             }
 
             debug_assert!(this.fut.is_some() || !this.stream.is_done());
