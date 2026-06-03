@@ -200,14 +200,28 @@ where
 {
     type Item = Fut::Output;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Fut::Output>> {
-        _ = self.as_mut().poll_progress(cx);
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Fut::Output>> {
         let mut this = self.project();
-        if let Some(output) = this.fut.as_mut().take_output() {
+
+        if this.fut.is_gone() {
+            match this.stream.as_mut().poll_next(cx) {
+                Poll::Ready(Some(item)) => {
+                    let fut = (this.f)(item);
+                    this.fut.set(MaybeDone::Future(fut));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        debug_assert!(!this.fut.is_gone(), "should short-circuit above");
+        _ = this.fut.as_mut().poll(cx);
+        if let Some(output) = this.fut.take_output() {
+            // We don't need `poll_progress` in this branch, because the caller must call
+            // `poll_next` or `poll_progress` again.
             Poll::Ready(Some(output))
-        } else if this.stream.is_done() && this.fut.is_gone() {
-            Poll::Ready(None)
         } else {
+            _ = this.stream.poll_progress(cx);
             Poll::Pending
         }
     }
@@ -217,17 +231,17 @@ where
         let mut is_pending = false;
 
         if this.fut.is_gone() {
-            match this.stream.poll_next(cx) {
+            match this.stream.as_mut().poll_next(cx) {
                 Poll::Ready(Some(item)) => {
                     let fut = (this.f)(item);
                     this.fut.set(MaybeDone::Future(fut));
                 }
-                Poll::Ready(None) => {
-                    return Poll::Ready(());
-                }
+                Poll::Ready(None) => return Poll::Ready(()),
                 Poll::Pending => return Poll::Pending,
             }
-        } else if this.stream.poll_progress(cx).is_pending() {
+        }
+
+        if this.stream.poll_progress(cx).is_pending() {
             is_pending = true;
         }
 
@@ -420,7 +434,7 @@ async fn main() {
         .then(|s| slow_push(s, 'j'))
         .for_each(async |x| {
             let elapsed = Instant::elapsed(&start).as_secs_f32();
-            println!("[{elapsed:6.3}s] {x}");
+            println!("[{elapsed:.3}s] {x}");
         })
         .await;
 }
