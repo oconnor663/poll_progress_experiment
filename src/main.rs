@@ -22,8 +22,7 @@ trait AsyncIterator {
         Then {
             stream: Some(self),
             f,
-            fut: None,
-            output: None,
+            fut: MaybeDone::Gone,
         }
     }
 
@@ -138,8 +137,7 @@ pin_project! {
         stream: Option<S>,
         f: F,
         #[pin]
-        fut: Option<Fut>,
-        output: Option<Fut::Output>,
+        fut: MaybeDone<Fut>,
     }
 }
 
@@ -153,10 +151,10 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Fut::Output>> {
         _ = self.as_mut().poll_progress(cx);
-        let this = self.project();
-        if let Some(output) = this.output.take() {
+        let mut this = self.project();
+        if let Some(output) = this.fut.as_mut().take_output() {
             Poll::Ready(Some(output))
-        } else if this.stream.is_none() && this.fut.is_none() {
+        } else if this.stream.is_none() && matches!(&*this.fut, MaybeDone::Gone) {
             Poll::Ready(None)
         } else {
             Poll::Pending
@@ -165,15 +163,14 @@ where
 
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut this = self.project();
-        debug_assert!(this.fut.is_none() || this.output.is_none());
         let mut is_pending = false;
 
         if let Some(stream) = this.stream.as_mut().as_pin_mut() {
-            if this.fut.is_none() && this.output.is_none() {
+            if matches!(&*this.fut, MaybeDone::Gone) {
                 match stream.poll_next(cx) {
                     Poll::Ready(Some(item)) => {
                         let fut = (this.f)(item);
-                        this.fut.set(Some(fut));
+                        this.fut.set(MaybeDone::Future(fut));
                     }
                     Poll::Ready(None) => {
                         this.stream.set(None);
@@ -186,14 +183,9 @@ where
             }
         }
 
-        if let Some(fut) = this.fut.as_mut().as_pin_mut() {
-            debug_assert!(this.output.is_none());
-            match fut.poll(cx) {
-                Poll::Ready(output) => {
-                    this.fut.set(None);
-                    *this.output = Some(output);
-                }
-                Poll::Pending => is_pending = true,
+        if matches!(&*this.fut, MaybeDone::Future(_)) {
+            if this.fut.poll(cx).is_pending() {
+                is_pending = true;
             }
         }
 
