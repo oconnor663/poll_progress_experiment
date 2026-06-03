@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 
 trait AsyncIterator {
     type Item;
@@ -93,6 +93,36 @@ impl<Fut: Future> AsyncIterator for Once<Fut> {
             return Poll::Ready(());
         }
         this.maybe_done.poll(cx)
+    }
+}
+
+fn iter<I>(iter: I) -> Iter<I::IntoIter>
+where
+    I: IntoIterator,
+{
+    Iter {
+        iter: iter.into_iter(),
+    }
+}
+
+struct Iter<I> {
+    iter: I,
+}
+
+impl<I> Unpin for Iter<I> {}
+
+impl<I> AsyncIterator for Iter<I>
+where
+    I: Iterator,
+{
+    type Item = I::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.iter.next())
+    }
+
+    fn poll_progress(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Ready(())
     }
 }
 
@@ -311,6 +341,21 @@ async fn main() {
             println!("Got {:?}, calling foo(999)...", item);
             foo(999).await;
             println!("...foo(999) finished");
+        })
+        .await;
+
+    println!("-----");
+
+    let start_time = Instant::now();
+    iter(0..10)
+        .then(async |x| {
+            sleep(Duration::from_millis(100)).await;
+            x
+        })
+        .for_each(async |x| {
+            sleep(Duration::from_millis(100)).await;
+            let elapsed = Instant::elapsed(&start_time).as_secs_f32();
+            println!("[{elapsed:.3}s] {x}");
         })
         .await;
 }
