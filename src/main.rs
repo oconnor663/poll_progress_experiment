@@ -414,24 +414,23 @@ async fn main() {
 
     println!("-----");
 
-    async fn slow_push(mut s: String, c: char) -> String {
+    async fn do_work(x: u64) -> u64 {
         sleep(Duration::from_millis(100)).await;
-        s.push(c);
-        s
+        x + 1
     }
 
     let start = Instant::now();
-    iter((0..10).map(|i| i.to_string()))
-        .then(|s| slow_push(s, 'a'))
-        .then(|s| slow_push(s, 'b'))
-        .then(|s| slow_push(s, 'c'))
-        .then(|s| slow_push(s, 'd'))
-        .then(|s| slow_push(s, 'e'))
-        .then(|s| slow_push(s, 'f'))
-        .then(|s| slow_push(s, 'g'))
-        .then(|s| slow_push(s, 'h'))
-        .then(|s| slow_push(s, 'i'))
-        .then(|s| slow_push(s, 'j'))
+    iter(0..10)
+        .then(do_work)
+        .then(do_work)
+        .then(do_work)
+        .then(do_work)
+        .then(do_work)
+        .then(do_work)
+        .then(do_work)
+        .then(do_work)
+        .then(do_work)
+        .then(do_work)
         .for_each(async |x| {
             let elapsed = Instant::elapsed(&start).as_secs_f32();
             println!("[{elapsed:.3}s] {x}");
