@@ -3,7 +3,8 @@ use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::sync::Mutex;
+use tokio::time::{Duration, sleep};
 
 trait AsyncIterator {
     type Item;
@@ -335,39 +336,28 @@ impl<Fut: Future> IsGoneExt for MaybeDone<Fut> {
     }
 }
 
-fn log_elapsed(start: &Instant, message: &str) {
-    let elapsed = Instant::elapsed(start).as_secs_f32();
-    println!("[{elapsed:.3}s] {message}");
-}
+static X: Mutex<()> = Mutex::const_new(());
 
 #[tokio::main]
 async fn main() {
-    let start = Instant::now();
-    let slow_stream = once(async {
-        sleep(Duration::from_millis(200)).await;
-        log_elapsed(&start, "print1");
-    })
-    .then(|()| async {
-        // BUG: This "print2" should appear immediately after "print1" above, but in this demo
-        // they're ~a second apart. The proximate cause is that `Then::poll_progress` doesn't call
-        // `Once::poll_next`. That's arguably correct, because we don't want aggressive buffering
-        // at every stage of the pipeline. The real problem is that `Merge` calls `poll_next` on
-        // both child streams, but after getting an item from `quick_stream`, it switches *both* to
-        // `poll_progress`. That's only valid for the stream it just got an item from. It must keep
-        // calling `poll_next` on `slow_stream` (at least) until it gets an item from there too.
-        log_elapsed(&start, "print2");
-        "slow"
+    let foo = once(async {
+        println!("1. `foo` locks `X` immediately.");
+        let guard = X.lock().await;
+        sleep(Duration::from_millis(20)).await;
+        println!("3. `poll_progress` drives `foo` to here...");
+        guard
     });
-    let quick_stream = once(async {
-        sleep(Duration::from_millis(100)).await;
-        "quick"
+    let bar = foo.then(async |guard| {
+        println!("4. ...but we never get here!");
+        drop(guard);
     });
-    slow_stream
-        .merge(quick_stream)
-        .for_each(async |item| {
-            log_elapsed(&start, &format!("for_each got {item:?}, sleeping..."));
-            sleep(Duration::from_secs(1)).await;
-            log_elapsed(&start, "...for_each sleep finished");
+    let fast = once(async {
+        sleep(Duration::from_millis(10)).await;
+    });
+    bar.merge(fast)
+        .for_each(async |()| {
+            println!("2. The main loop tries to lock `X` and waits.");
+            _ = X.lock().await; // Deadlock!
         })
         .await;
 }
