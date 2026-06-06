@@ -3,7 +3,6 @@ use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, sleep};
 
 trait AsyncIterator {
@@ -103,36 +102,6 @@ impl<Fut: Future> AsyncIterator for Once<Fut> {
     }
 }
 
-fn iter<I>(iter: I) -> Iter<I::IntoIter>
-where
-    I: IntoIterator,
-{
-    Iter {
-        iter: iter.into_iter(),
-    }
-}
-
-struct Iter<I> {
-    iter: I,
-}
-
-impl<I> Unpin for Iter<I> {}
-
-impl<I> AsyncIterator for Iter<I>
-where
-    I: Iterator,
-{
-    type Item = I::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Option<Self::Item>> {
-        Poll::Ready(self.iter.next())
-    }
-
-    fn poll_progress(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<()> {
-        Poll::Ready(())
-    }
-}
-
 pin_project! {
     #[must_use]
     struct Fuse<S> {
@@ -227,24 +196,15 @@ where
     }
 
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
-        let mut this = self.project();
+        let this = self.project();
         let mut is_pending = false;
 
-        if this.fut.is_gone() {
-            match this.stream.as_mut().poll_next(cx) {
-                Poll::Ready(Some(item)) => {
-                    let fut = (this.f)(item);
-                    this.fut.set(MaybeDone::Future(fut));
-                }
-                Poll::Ready(None) => return Poll::Ready(()),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
+        // NOTE: In this version, `Then::poll_progress` never calls `stream.poll_next`.
         if this.stream.poll_progress(cx).is_pending() {
             is_pending = true;
         }
 
+        // But we do still drive the current future, if there is one.
         if !this.fut.is_gone() {
             if this.fut.poll(cx).is_pending() {
                 is_pending = true;
@@ -375,65 +335,39 @@ impl<Fut: Future> IsGoneExt for MaybeDone<Fut> {
     }
 }
 
-async fn foo(i: i32) -> i32 {
-    static LOCK: Mutex<()> = Mutex::const_new(());
-    println!("foo({i})");
-    let _guard = LOCK.lock().await;
-    sleep(Duration::from_millis(10)).await;
-    i
+fn log_elapsed(start: &Instant, message: &str) {
+    let elapsed = Instant::elapsed(start).as_secs_f32();
+    println!("[{elapsed:.3}s] {message}");
 }
 
 #[tokio::main]
 async fn main() {
-    let stream1 = once(foo(1));
-    let stream2 = once(foo(2));
-    let merged = stream1.merge(stream2);
-    merged
-        .then(async |i| foo(10 * i).await)
-        .for_each(async |item| {
-            println!("Got {:?}, calling foo(999)...", item);
-            foo(999).await;
-            println!("...foo(999) finished");
-        })
-        .await;
-
-    println!("-----");
-
     let start = Instant::now();
-    iter(0..10)
-        .then(async |x| {
-            sleep(Duration::from_millis(100)).await;
-            x
-        })
-        .for_each(async |x| {
-            sleep(Duration::from_millis(100)).await;
-            let elapsed = Instant::elapsed(&start).as_secs_f32();
-            println!("[{elapsed:.3}s] {x}");
-        })
-        .await;
-
-    println!("-----");
-
-    async fn do_work(x: u64) -> u64 {
+    let slow_stream = once(async {
+        sleep(Duration::from_millis(200)).await;
+        log_elapsed(&start, "print1");
+    })
+    .then(|()| async {
+        // BUG: This "print2" should appear immediately after "print1" above, but in this demo
+        // they're ~a second apart. The proximate cause is that `Then::poll_progress` doesn't call
+        // `Once::poll_next`. That's arguably correct, because we don't want aggressive buffering
+        // at every stage of the pipeline. The real problem is that `Merge` calls `poll_next` on
+        // both child streams, but after getting an item from `quick_stream`, it switches *both* to
+        // `poll_progress`. That's only valid for the stream it just got an item from. It must keep
+        // calling `poll_next` on `slow_stream` (at least) until it gets an item from there too.
+        log_elapsed(&start, "print2");
+        "slow"
+    });
+    let quick_stream = once(async {
         sleep(Duration::from_millis(100)).await;
-        x + 1
-    }
-
-    let start = Instant::now();
-    iter(0..10)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .for_each(async |x| {
-            let elapsed = Instant::elapsed(&start).as_secs_f32();
-            println!("[{elapsed:.3}s] {x}");
+        "quick"
+    });
+    slow_stream
+        .merge(quick_stream)
+        .for_each(async |item| {
+            log_elapsed(&start, &format!("for_each got {item:?}, sleeping..."));
+            sleep(Duration::from_secs(1)).await;
+            log_elapsed(&start, "...for_each sleep finished");
         })
         .await;
 }
