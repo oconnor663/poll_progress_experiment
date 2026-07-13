@@ -1,15 +1,13 @@
 use pin_project_lite::pin_project;
 use std::future::Future;
-use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{Duration, sleep};
 
 trait AsyncIterator {
     type Item;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollNext<Self::Item>;
 
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()>;
 
@@ -17,7 +15,7 @@ trait AsyncIterator {
     where
         Self: Sized,
     {
-        Fuse { stream: Some(self) }
+        Fuse { iter: Some(self) }
     }
 
     fn then<F, Fut>(self, f: F) -> Then<Self, F, Fut>
@@ -27,79 +25,60 @@ trait AsyncIterator {
         Fut: Future,
     {
         Then {
-            stream: self.fuse(),
+            iter: self,
             f,
             fut: None,
         }
     }
 
-    fn merge<S2>(self, other: S2) -> Merge<Self, S2>
+    fn map<F, T>(self, f: F) -> Map<Self, F>
     where
         Self: Sized,
-        S2: AsyncIterator<Item = Self::Item>,
+        F: FnMut(Self::Item) -> T,
+    {
+        Map { iter: self, f }
+    }
+
+    fn merge<Other>(self, other: Other) -> Merge<Self, Other>
+    where
+        Self: Sized,
+        Other: AsyncIterator<Item = Self::Item>,
     {
         Merge {
-            stream1: self.fuse(),
-            stream2: other.fuse(),
-            progress: MergeProgress::Invalid,
+            left: self.fuse(),
+            right: other.fuse(),
+            poll_next_never_called: true,
+            left_is_current: true,
+            buffered: None,
         }
     }
 
-    fn for_each<F, Fut>(self, f: F) -> ForEach<Self, F, Fut>
+    fn try_for_each<F, Fut>(self, f: F) -> TryForEach<Self, F, Fut>
     where
         Self: Sized,
         F: FnMut(Self::Item) -> Fut,
-        Fut: Future<Output = ()>,
+        Fut: Future<Output = ControlFlow>,
     {
-        ForEach {
-            stream: self.fuse(),
+        TryForEach {
+            iter: self,
             f,
             fut: None,
         }
     }
 }
 
-fn once<Fut>(future: Fut) -> Once<Fut>
-where
-    Fut: Future,
-{
-    Once {
-        future: Some(future),
-    }
+enum PollNext<Item> {
+    Item(Item),
+    Pending,
+    Done,
 }
 
-pin_project! {
-    #[must_use]
-    struct Once<Fut>
-    where
-        Fut: Future,
-    {
-        #[pin]
-        future: Option<Fut>,
-    }
-}
-
-impl<Fut: Future> AsyncIterator for Once<Fut> {
-    type Item = Fut::Output;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-        match this.future.as_mut().as_pin_mut() {
-            Some(fut) => match fut.poll(cx) {
-                Poll::Ready(output) => {
-                    this.future.set(None);
-                    Poll::Ready(Some(output))
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            None => Poll::Ready(None),
-        }
-    }
-
-    fn poll_progress(self: Pin<&mut Self>, _: &mut Context) -> Poll<()> {
-        match &self.future {
-            Some(_) => panic!("poll_progress called before poll_next"),
-            None => Poll::Ready(()),
+impl<Item> PollNext<Item> {
+    fn map<T>(self, f: impl FnOnce(Item) -> T) -> PollNext<T> {
+        match self {
+            PollNext::Item(item) => PollNext::Item(f(item)),
+            PollNext::Pending => PollNext::Pending,
+            PollNext::Done => PollNext::Done,
         }
     }
 }
@@ -125,8 +104,11 @@ where
 {
     type Item = I::Item;
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Option<Self::Item>> {
-        Poll::Ready(self.iter.next())
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context) -> PollNext<Self::Item> {
+        match self.iter.next() {
+            Some(item) => PollNext::Item(item),
+            None => PollNext::Done,
+        }
     }
 
     fn poll_progress(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<()> {
@@ -136,43 +118,43 @@ where
 
 pin_project! {
     #[must_use]
-    struct Fuse<S> {
+    struct Fuse<Iter> {
         #[pin]
-        stream: Option<S>,
+        iter: Option<Iter>,
     }
 }
 
-impl<S> Fuse<S> {
+impl<Iter> Fuse<Iter> {
     fn is_done(&self) -> bool {
-        self.stream.is_none()
+        self.iter.is_none()
     }
 }
 
-impl<S> AsyncIterator for Fuse<S>
+impl<Iter> AsyncIterator for Fuse<Iter>
 where
-    S: AsyncIterator,
+    Iter: AsyncIterator,
 {
-    type Item = S::Item;
+    type Item = Iter::Item;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<S::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollNext<Iter::Item> {
         let mut this = self.project();
-        match this.stream.as_mut().as_pin_mut() {
-            Some(stream) => match stream.poll_next(cx) {
-                Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
-                Poll::Ready(None) => {
-                    this.stream.set(None);
-                    Poll::Ready(None)
+        match this.iter.as_mut().as_pin_mut() {
+            Some(iter) => match iter.poll_next(cx) {
+                PollNext::Item(item) => PollNext::Item(item),
+                PollNext::Done => {
+                    this.iter.set(None);
+                    PollNext::Done
                 }
-                Poll::Pending => Poll::Pending,
+                PollNext::Pending => PollNext::Pending,
             },
-            None => Poll::Ready(None),
+            None => PollNext::Done,
         }
     }
 
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         let this = self.project();
-        match this.stream.as_pin_mut() {
-            Some(stream) => stream.poll_progress(cx),
+        match this.iter.as_pin_mut() {
+            Some(iter) => iter.poll_progress(cx),
             None => Poll::Ready(()),
         }
     }
@@ -180,39 +162,65 @@ where
 
 pin_project! {
     #[must_use]
-    struct Then<S, F, Fut>
+    struct Map<Iter, F> {
+        #[pin]
+        iter: Iter,
+        f: F,
+    }
+}
+
+impl<Iter, F, T> AsyncIterator for Map<Iter, F>
+where
+    Iter: AsyncIterator,
+    F: FnMut(Iter::Item) -> T,
+{
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollNext<Self::Item> {
+        let this = self.project();
+        this.iter.poll_next(cx).map(this.f)
+    }
+
+    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
+        self.project().iter.poll_progress(cx)
+    }
+}
+
+pin_project! {
+    #[must_use]
+    struct Then<Iter, F, Fut>
     where
-        S: AsyncIterator,
-        F: FnMut(S::Item) -> Fut,
+        Iter: AsyncIterator,
+        F: FnMut(Iter::Item) -> Fut,
         Fut: Future,
     {
         #[pin]
-        stream: Fuse<S>,
+        iter: Iter,
         f: F,
         #[pin]
         fut: Option<Fut>,
     }
 }
 
-impl<S, F, Fut> AsyncIterator for Then<S, F, Fut>
+impl<Iter, F, Fut> AsyncIterator for Then<Iter, F, Fut>
 where
-    S: AsyncIterator,
-    F: FnMut(S::Item) -> Fut,
+    Iter: AsyncIterator,
+    F: FnMut(Iter::Item) -> Fut,
     Fut: Future,
 {
     type Item = Fut::Output;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Fut::Output>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollNext<Fut::Output> {
         let mut this = self.project();
 
         if this.fut.is_none() {
-            match this.stream.as_mut().poll_next(cx) {
-                Poll::Ready(Some(item)) => {
+            match this.iter.as_mut().poll_next(cx) {
+                PollNext::Item(item) => {
                     let fut = (this.f)(item);
                     this.fut.set(Some(fut));
                 }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+                PollNext::Done => return PollNext::Done,
+                PollNext::Pending => return PollNext::Pending,
             }
         }
 
@@ -220,243 +228,272 @@ where
         match fut.poll(cx) {
             Poll::Ready(output) => {
                 this.fut.set(None);
-                Poll::Ready(Some(output))
+                PollNext::Item(output)
             }
             Poll::Pending => {
-                _ = this.stream.as_mut().poll_progress(cx);
-                Poll::Pending
+                _ = this.iter.as_mut().poll_progress(cx);
+                PollNext::Pending
             }
         }
     }
 
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
-        let this = self.project();
-        assert!(
-            this.fut.is_none(),
-            "can't call poll_progress while poll_next is pending"
-        );
-        this.stream.poll_progress(cx)
+        assert!(self.fut.is_none());
+        self.project().iter.poll_progress(cx)
     }
 }
 
-enum MergeProgress<Item> {
-    Invalid,
-    PollNextStream1,
-    PollNextStream2,
-    Buffered(Item),
-    EmptyBuffer,
+fn any_pending(polls: impl IntoIterator<Item = Poll<()>>) -> Poll<()> {
+    for poll in polls {
+        if poll.is_pending() {
+            return Poll::Pending;
+        }
+    }
+    Poll::Ready(())
 }
 
-pin_project! {
-    #[must_use]
-    struct Merge<S1, S2>
-    where
-        S1: AsyncIterator,
-        S2: AsyncIterator<Item = S1::Item>,
-    {
-        #[pin]
-        stream1: Fuse<S1>,
-        #[pin]
-        stream2: Fuse<S2>,
-        progress: MergeProgress<S1::Item>,
+fn update_pending(ret: &mut Poll<()>, poll: Poll<()>) {
+    if poll.is_pending() {
+        *ret = Poll::Pending;
     }
 }
 
-impl<S1, S2> AsyncIterator for Merge<S1, S2>
+enum EitherPin<'a, S1, S2> {
+    Left(Pin<&'a mut S1>),
+    Right(Pin<&'a mut S2>),
+}
+
+impl<'a, S1, S2> EitherPin<'a, S1, S2>
 where
     S1: AsyncIterator,
     S2: AsyncIterator<Item = S1::Item>,
 {
-    type Item = S1::Item;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-        let progress = mem::replace(this.progress, MergeProgress::Invalid);
-        if let MergeProgress::Buffered(item) = progress {
-            *this.progress = MergeProgress::EmptyBuffer;
-            return Poll::Ready(Some(item));
-        }
-        // TODO: Some sort of fairness here.
-        if let Poll::Ready(Some(item)) = this.stream1.as_mut().poll_next(cx) {
-            *this.progress = MergeProgress::PollNextStream2;
-            return Poll::Ready(Some(item));
-        }
-        if let Poll::Ready(Some(item)) = this.stream2.as_mut().poll_next(cx) {
-            *this.progress = MergeProgress::PollNextStream1;
-            return Poll::Ready(Some(item));
-        }
-        // It's not allowed to call poll_progress after poll_next returns Pending or Ready(None),
-        // so leave the MergeProgress::Invalid in place.
-        if this.stream1.is_done() && this.stream2.is_done() {
-            Poll::Ready(None)
-        } else {
-            Poll::Pending
+    fn poll_next(self, cx: &mut Context) -> PollNext<S1::Item> {
+        match self {
+            EitherPin::Left(s1) => s1.poll_next(cx),
+            EitherPin::Right(s2) => s2.poll_next(cx),
         }
     }
 
-    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
-        let this = self.project();
-        let mut pending = false;
-        match this.progress {
-            MergeProgress::Invalid => panic!("invalid call to poll_progress"),
-            MergeProgress::Buffered(_) | MergeProgress::EmptyBuffer => {
-                if this.stream1.poll_progress(cx).is_pending() {
-                    pending = true;
-                }
-                if this.stream2.poll_progress(cx).is_pending() {
-                    pending = true;
-                }
-            }
-            MergeProgress::PollNextStream1 => {
-                match this.stream1.poll_next(cx) {
-                    Poll::Ready(Some(item)) => *this.progress = MergeProgress::Buffered(item),
-                    Poll::Ready(None) => {}
-                    Poll::Pending => pending = true,
-                }
-                if this.stream2.poll_progress(cx).is_pending() {
-                    pending = true;
-                }
-            }
-            MergeProgress::PollNextStream2 => {
-                if this.stream1.poll_progress(cx).is_pending() {
-                    pending = true;
-                }
-                match this.stream2.poll_next(cx) {
-                    Poll::Ready(Some(item)) => *this.progress = MergeProgress::Buffered(item),
-                    Poll::Ready(None) => {}
-                    Poll::Pending => pending = true,
-                }
-            }
-        }
-        if pending {
-            Poll::Pending
-        } else {
-            Poll::Ready(())
+    fn poll_progress(self, cx: &mut Context) -> Poll<()> {
+        match self {
+            EitherPin::Left(s1) => s1.poll_progress(cx),
+            EitherPin::Right(s2) => s2.poll_progress(cx),
         }
     }
 }
 
 pin_project! {
     #[must_use]
-    struct ForEach<S, F, Fut>
+    #[project = MergeProj]
+    pub struct Merge<Left, Right>
     where
-        S: AsyncIterator,
-        F: FnMut(S::Item) -> Fut,
-        Fut: Future<Output = ()>,
+        Left: AsyncIterator,
+        Right: AsyncIterator<Item = Left::Item>,
     {
         #[pin]
-        stream: Fuse<S>,
+        left: Fuse<Left>,
+        #[pin]
+        right: Fuse<Right>,
+        poll_next_never_called: bool,
+        left_is_current: bool,
+        buffered: Option<Left::Item>,
+    }
+}
+
+impl<'p, Left, Right> MergeProj<'p, Left, Right>
+where
+    Left: AsyncIterator,
+    Right: AsyncIterator<Item = Left::Item>,
+{
+    fn current_iter(
+        self: &mut MergeProj<'p, Left, Right>,
+    ) -> EitherPin<'_, Fuse<Left>, Fuse<Right>> {
+        if *self.left_is_current {
+            EitherPin::Left(self.left.as_mut())
+        } else {
+            EitherPin::Right(self.right.as_mut())
+        }
+    }
+
+    fn other_iter(self: &mut MergeProj<'p, Left, Right>) -> EitherPin<'_, Fuse<Left>, Fuse<Right>> {
+        if *self.left_is_current {
+            EitherPin::Right(self.right.as_mut())
+        } else {
+            EitherPin::Left(self.left.as_mut())
+        }
+    }
+
+    fn swap_current_iter(self: &mut MergeProj<'p, Left, Right>) {
+        *self.left_is_current = !*self.left_is_current;
+    }
+}
+
+impl<Left, Right> AsyncIterator for Merge<Left, Right>
+where
+    Left: AsyncIterator,
+    Right: AsyncIterator<Item = Left::Item>,
+{
+    type Item = Left::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollNext<Self::Item> {
+        let mut this = self.project();
+        *this.poll_next_never_called = false;
+        if let Some(item) = this.buffered.take() {
+            // If there's a buffered item, `poll_progress` got it from the current iterator.
+            this.swap_current_iter();
+            return PollNext::Item(item);
+        }
+        if let PollNext::Item(item) = this.current_iter().poll_next(cx) {
+            this.swap_current_iter();
+            return PollNext::Item(item);
+        }
+        if let PollNext::Item(item) = this.other_iter().poll_next(cx) {
+            return PollNext::Item(item);
+        }
+        if this.left.is_done() && this.right.is_done() {
+            PollNext::Done
+        } else {
+            PollNext::Pending
+        }
+    }
+
+    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
+        let mut this = self.project();
+        if *this.poll_next_never_called {
+            let poll1 = this.left.as_mut().poll_progress(cx);
+            let poll2 = this.right.as_mut().poll_progress(cx);
+            return any_pending([poll1, poll2]);
+        }
+        let mut ret = Poll::Ready(());
+        if this.buffered.is_none() {
+            match this.current_iter().poll_next(cx) {
+                PollNext::Item(item) => *this.buffered = Some(item),
+                PollNext::Done => {}
+                PollNext::Pending => ret = Poll::Pending,
+            }
+        }
+        if this.buffered.is_some() {
+            let poll = this.current_iter().poll_progress(cx);
+            update_pending(&mut ret, poll);
+        }
+        let poll = this.other_iter().poll_progress(cx);
+        update_pending(&mut ret, poll);
+        ret
+    }
+}
+
+pub enum ControlFlow {
+    Continue,
+    Break,
+}
+
+pin_project! {
+    #[must_use]
+    struct TryForEach<Iter, F, Fut>
+    where
+        Iter: AsyncIterator,
+        F: FnMut(Iter::Item) -> Fut,
+        Fut: Future,
+    {
+        #[pin]
+        iter: Iter,
         f: F,
         #[pin]
         fut: Option<Fut>,
     }
 }
 
-impl<S, F, Fut> Future for ForEach<S, F, Fut>
+impl<Iter, F, Fut> Future for TryForEach<Iter, F, Fut>
 where
-    S: AsyncIterator,
-    F: FnMut(S::Item) -> Fut,
-    Fut: Future<Output = ()>,
+    Iter: AsyncIterator,
+    F: FnMut(Iter::Item) -> Fut,
+    Fut: Future<Output = ControlFlow>,
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let mut this = self.project();
         loop {
             // If we need a new future, try to get one. If we can't get one, short-circuit.
             if this.fut.is_none() {
-                match this.stream.as_mut().poll_next(cx) {
-                    Poll::Ready(Some(item)) => {
+                match this.iter.as_mut().poll_next(cx) {
+                    PollNext::Item(item) => {
                         let fut = (this.f)(item);
                         this.fut.set(Some(fut));
                         // If the new future is ready on its first poll below, we'll loop around
                         // and try to make another one. If not, we'll poll_progress before we
                         // yield.
                     }
-                    Poll::Ready(None) => return Poll::Ready(()),
-                    Poll::Pending => return Poll::Pending,
+                    PollNext::Done => return Poll::Ready(()),
+                    PollNext::Pending => return Poll::Pending,
                 }
             }
-
             // We have a future. Try to finish it.
-            if this.fut.as_mut().as_pin_mut().unwrap().poll(cx).is_ready() {
-                this.fut.set(None);
-                if this.stream.is_done() {
-                    return Poll::Ready(());
-                } else {
-                    // Loop around and try to get another future.
-                    continue;
+            match this.fut.as_mut().as_pin_mut().unwrap().poll(cx) {
+                Poll::Ready(output) => match output {
+                    ControlFlow::Continue => {
+                        this.fut.set(None);
+                        // Loop around and try to get another future.
+                    }
+                    ControlFlow::Break => {
+                        return Poll::Ready(());
+                    }
+                },
+                Poll::Pending => {
+                    // If the future is pending, let the iterator make progress concurrently.
+                    _ = this.iter.as_mut().poll_progress(cx);
+                    return Poll::Pending;
                 }
-            } else {
-                // If the future is pending, let the stream make progress concurrently.
-                _ = this.stream.as_mut().poll_progress(cx);
             }
-
-            debug_assert!(this.fut.is_some() || !this.stream.is_done());
-            return Poll::Pending;
         }
     }
 }
 
-async fn foo(i: i32) -> i32 {
-    static LOCK: Mutex<()> = Mutex::const_new(());
-    println!("foo({i})");
-    let _guard = LOCK.lock().await;
-    sleep(Duration::from_millis(10)).await;
-    i
+// async gen fn slow_numbers() -> u32 {
+//     for i in 0..10 {
+//         sleep(Duration::from_millis(1)).await;
+//         yield i;
+//     }
+// }
+fn slow_numbers() -> impl AsyncIterator<Item = u32> {
+    iter(0..10).then(async |i| {
+        sleep(Duration::from_millis(1)).await;
+        i
+    })
+}
+
+fn print_numbers() -> impl AsyncIterator<Item = u32> {
+    slow_numbers().map(|i| {
+        println!("NUMBER {i}");
+        i
+    })
 }
 
 #[tokio::main]
 async fn main() {
-    let stream1 = once(foo(1));
-    let stream2 = once(foo(2));
-    let merged = stream1.merge(stream2);
-    merged
-        .then(async |i| foo(10 * i).await)
-        .for_each(async |item| {
-            println!("Got {:?}, calling foo(999)...", item);
-            foo(999).await;
-            println!("...foo(999) finished");
+    println!("--- first loop ---");
+    // for await _ in print_numbers() {
+    //     sleep(Duration::from_millis(10)).await;
+    //     break;
+    // }
+    print_numbers()
+        .try_for_each(async |_| {
+            sleep(Duration::from_millis(10)).await;
+            ControlFlow::Break
         })
         .await;
 
-    println!("-----");
-
-    let start = Instant::now();
-    iter(0..10)
-        .then(async |x| {
-            sleep(Duration::from_millis(100)).await;
-            x
-        })
-        .for_each(async |x| {
-            sleep(Duration::from_millis(100)).await;
-            let elapsed = Instant::elapsed(&start).as_secs_f32();
-            println!("[{elapsed:.3}s] {x}");
-        })
-        .await;
-
-    println!("-----");
-
-    async fn do_work(x: u64) -> u64 {
-        sleep(Duration::from_millis(10)).await;
-        x + 1
-    }
-
-    let start = Instant::now();
-    iter(0..10)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .then(do_work)
-        .for_each(async |x| {
-            let elapsed = Instant::elapsed(&start).as_secs_f32();
-            println!("[{elapsed:.3}s] {x}");
+    println!("\n---second loop ---");
+    // for await _ in print_numbers().merge(print_numbers()) {
+    //     sleep(Duration::from_millis(10)).await;
+    //     break;
+    // }
+    print_numbers()
+        .merge(print_numbers())
+        .try_for_each(async |_| {
+            sleep(Duration::from_millis(10)).await;
+            ControlFlow::Break
         })
         .await;
 }
