@@ -1,7 +1,10 @@
+use futures::future::poll_fn;
 use pin_project_lite::pin_project;
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, TryLockError};
+use std::task::{Context, Poll, Waker};
 use tokio::time::{Duration, sleep};
 
 trait AsyncIterator {
@@ -11,32 +14,14 @@ trait AsyncIterator {
 
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()>;
 
+    /// Wrap an `AsyncIterator` so that it can be polled again after returning `Done`. Internally,
+    /// the iterator is dropped the first time `poll_next` returns `Done`, and subsequent polls
+    /// return `Done` or `Ready` again.
     fn fuse(self) -> Fuse<Self>
     where
         Self: Sized,
     {
         Fuse { iter: Some(self) }
-    }
-
-    fn then<F, Fut>(self, f: F) -> Then<Self, F, Fut>
-    where
-        Self: Sized,
-        F: FnMut(Self::Item) -> Fut,
-        Fut: Future,
-    {
-        Then {
-            iter: self,
-            f,
-            fut: None,
-        }
-    }
-
-    fn map<F, T>(self, f: F) -> Map<Self, F>
-    where
-        Self: Sized,
-        F: FnMut(Self::Item) -> T,
-    {
-        Map { iter: self, f }
     }
 
     fn merge<Other>(self, other: Other) -> Merge<Self, Other>
@@ -53,16 +38,17 @@ trait AsyncIterator {
         }
     }
 
-    fn try_for_each<F, Fut>(self, f: F) -> TryForEach<Self, F, Fut>
+    fn for_each<F, Fut>(self, f: F) -> ForEach<Self, F, Fut>
     where
         Self: Sized,
         F: FnMut(Self::Item) -> Fut,
-        Fut: Future<Output = ControlFlow>,
+        Fut: Future<Output = ()>,
     {
-        TryForEach {
+        ForEach {
             iter: self,
             f,
             fut: None,
+            progress_pending: false,
         }
     }
 }
@@ -71,49 +57,6 @@ enum PollNext<Item> {
     Item(Item),
     Pending,
     Done,
-}
-
-impl<Item> PollNext<Item> {
-    fn map<T>(self, f: impl FnOnce(Item) -> T) -> PollNext<T> {
-        match self {
-            PollNext::Item(item) => PollNext::Item(f(item)),
-            PollNext::Pending => PollNext::Pending,
-            PollNext::Done => PollNext::Done,
-        }
-    }
-}
-
-fn iter<I>(iter: I) -> Iter<I::IntoIter>
-where
-    I: IntoIterator,
-{
-    Iter {
-        iter: iter.into_iter(),
-    }
-}
-
-struct Iter<I> {
-    iter: I,
-}
-
-impl<I> Unpin for Iter<I> {}
-
-impl<I> AsyncIterator for Iter<I>
-where
-    I: Iterator,
-{
-    type Item = I::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context) -> PollNext<Self::Item> {
-        match self.iter.next() {
-            Some(item) => PollNext::Item(item),
-            None => PollNext::Done,
-        }
-    }
-
-    fn poll_progress(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<()> {
-        Poll::Ready(())
-    }
 }
 
 pin_project! {
@@ -157,89 +100,6 @@ where
             Some(iter) => iter.poll_progress(cx),
             None => Poll::Ready(()),
         }
-    }
-}
-
-pin_project! {
-    #[must_use]
-    struct Map<Iter, F> {
-        #[pin]
-        iter: Iter,
-        f: F,
-    }
-}
-
-impl<Iter, F, T> AsyncIterator for Map<Iter, F>
-where
-    Iter: AsyncIterator,
-    F: FnMut(Iter::Item) -> T,
-{
-    type Item = T;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollNext<Self::Item> {
-        let this = self.project();
-        this.iter.poll_next(cx).map(this.f)
-    }
-
-    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
-        self.project().iter.poll_progress(cx)
-    }
-}
-
-pin_project! {
-    #[must_use]
-    struct Then<Iter, F, Fut>
-    where
-        Iter: AsyncIterator,
-        F: FnMut(Iter::Item) -> Fut,
-        Fut: Future,
-    {
-        #[pin]
-        iter: Iter,
-        f: F,
-        #[pin]
-        fut: Option<Fut>,
-    }
-}
-
-impl<Iter, F, Fut> AsyncIterator for Then<Iter, F, Fut>
-where
-    Iter: AsyncIterator,
-    F: FnMut(Iter::Item) -> Fut,
-    Fut: Future,
-{
-    type Item = Fut::Output;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollNext<Fut::Output> {
-        let mut this = self.project();
-
-        if this.fut.is_none() {
-            match this.iter.as_mut().poll_next(cx) {
-                PollNext::Item(item) => {
-                    let fut = (this.f)(item);
-                    this.fut.set(Some(fut));
-                }
-                PollNext::Done => return PollNext::Done,
-                PollNext::Pending => return PollNext::Pending,
-            }
-        }
-
-        let fut = this.fut.as_mut().as_pin_mut().expect("populated above");
-        match fut.poll(cx) {
-            Poll::Ready(output) => {
-                this.fut.set(None);
-                PollNext::Item(output)
-            }
-            Poll::Pending => {
-                _ = this.iter.as_mut().poll_progress(cx);
-                PollNext::Pending
-            }
-        }
-    }
-
-    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
-        assert!(self.fut.is_none());
-        self.project().iter.poll_progress(cx)
     }
 }
 
@@ -383,14 +243,9 @@ where
     }
 }
 
-pub enum ControlFlow {
-    Continue,
-    Break,
-}
-
 pin_project! {
     #[must_use]
-    struct TryForEach<Iter, F, Fut>
+    struct ForEach<Iter, F, Fut>
     where
         Iter: AsyncIterator,
         F: FnMut(Iter::Item) -> Fut,
@@ -401,14 +256,15 @@ pin_project! {
         f: F,
         #[pin]
         fut: Option<Fut>,
+        progress_pending: bool,
     }
 }
 
-impl<Iter, F, Fut> Future for TryForEach<Iter, F, Fut>
+impl<Iter, F, Fut> Future for ForEach<Iter, F, Fut>
 where
     Iter: AsyncIterator,
     F: FnMut(Iter::Item) -> Fut,
-    Fut: Future<Output = ControlFlow>,
+    Fut: Future<Output = ()>,
 {
     type Output = ();
 
@@ -421,6 +277,7 @@ where
                     PollNext::Item(item) => {
                         let fut = (this.f)(item);
                         this.fut.set(Some(fut));
+                        *this.progress_pending = true;
                         // If the new future is ready on its first poll below, we'll loop around
                         // and try to make another one. If not, we'll poll_progress before we
                         // yield.
@@ -431,18 +288,15 @@ where
             }
             // We have a future. Try to finish it.
             match this.fut.as_mut().as_pin_mut().unwrap().poll(cx) {
-                Poll::Ready(output) => match output {
-                    ControlFlow::Continue => {
-                        this.fut.set(None);
-                        // Loop around and try to get another future.
-                    }
-                    ControlFlow::Break => {
-                        return Poll::Ready(());
-                    }
-                },
+                Poll::Ready(()) => {
+                    this.fut.set(None);
+                    // Loop around and try to get another future.
+                }
                 Poll::Pending => {
                     // If the future is pending, let the iterator make progress concurrently.
-                    _ = this.iter.as_mut().poll_progress(cx);
+                    if *this.progress_pending {
+                        *this.progress_pending = this.iter.as_mut().poll_progress(cx).is_pending();
+                    }
                     return Poll::Pending;
                 }
             }
@@ -450,50 +304,160 @@ where
     }
 }
 
-// async gen fn slow_numbers() -> u32 {
-//     for i in 0..10 {
-//         sleep(Duration::from_millis(1)).await;
-//         yield i;
-//     }
-// }
-fn slow_numbers() -> impl AsyncIterator<Item = u32> {
-    iter(0..10).then(async |i| {
-        sleep(Duration::from_millis(1)).await;
-        i
-    })
+pin_project! {
+    #[must_use]
+    struct Once<Fut: Future> {
+        #[pin]
+        future: Option<Fut>,
+        output: Option<Fut::Output>,
+    }
 }
 
-fn print_numbers() -> impl AsyncIterator<Item = u32> {
-    slow_numbers().map(|i| {
-        println!("NUMBER {i}");
-        i
-    })
+fn once<Fut: Future>(future: Fut) -> Once<Fut> {
+    Once {
+        future: Some(future),
+        output: None,
+    }
+}
+
+impl<Fut: Future> AsyncIterator for Once<Fut> {
+    type Item = Fut::Output;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollNext<Self::Item> {
+        let mut this = self.project();
+        if let Some(output) = this.output.take() {
+            PollNext::Item(output)
+        } else if let Some(future) = this.future.as_mut().as_pin_mut() {
+            match future.poll(cx) {
+                Poll::Ready(output) => {
+                    this.future.set(None);
+                    PollNext::Item(output)
+                }
+                Poll::Pending => PollNext::Pending,
+            }
+        } else {
+            PollNext::Done
+        }
+    }
+
+    fn poll_progress(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
+        let mut this = self.project();
+        // It should be rare for `Once::poll_progress` to be called while `future` is `Some`, but
+        // it can happen for example on the right side of a `Chain`. This is different from `Then`,
+        // which has no future to drive in the same situation. When the `AsyncFn` traits are better
+        // supported in the (hopefully near) future, it would be interesting to consider a variant
+        // of `Once` that took an `AsyncFnOnce` rather than a `Future`. That version could have a
+        // no-op `poll_progress`.
+        if let Some(future) = this.future.as_mut().as_pin_mut() {
+            match future.poll(cx) {
+                Poll::Ready(output) => {
+                    *this.output = Some(output);
+                    this.future.set(None);
+                    Poll::Ready(())
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+struct Lock<T> {
+    value: std::sync::Mutex<T>,
+    wakers: StdMutex<Vec<Waker>>,
+}
+
+impl<T> Lock<T> {
+    const fn new(value: T) -> Self {
+        Self {
+            value: StdMutex::new(value),
+            wakers: StdMutex::new(Vec::new()),
+        }
+    }
+
+    async fn lock(&self) -> Guard<'_, T> {
+        poll_fn(|cx| {
+            let mut wakers = self.wakers.lock().unwrap();
+            match self.value.try_lock() {
+                Ok(guard) => Poll::Ready(Guard::new(self, guard)),
+                Err(TryLockError::Poisoned(_)) => panic!("poisoned"),
+                Err(TryLockError::WouldBlock) => {
+                    wakers.push(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+}
+
+struct Guard<'a, T> {
+    mutex: &'a Lock<T>,
+    std_guard: StdMutexGuard<'a, T>,
+}
+
+impl<'a, T> Guard<'a, T> {
+    fn new(mutex: &'a Lock<T>, std_guard: StdMutexGuard<'a, T>) -> Self {
+        Self { mutex, std_guard }
+    }
+}
+
+impl<T> Deref for Guard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.std_guard
+    }
+}
+
+impl<T> DerefMut for Guard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.std_guard
+    }
+}
+
+impl<T> Drop for Guard<'_, T> {
+    fn drop(&mut self) {
+        // XXX: This is a hacky implementation, and there are multithreading bugs here. (This
+        // example is single-task/single-thread, and the only reason we use `std::sync::Mutex` at
+        // all here is to be `Sync` for the `static` below.) Another thread could respond to `wake`
+        // and call `try_lock` before we return and drop the guard, which would cause a missed
+        // wakeup. A custom `Waker` implementation could also try to lock `wakers` reentrantly,
+        // which would deadlock.
+        self.mutex
+            .wakers
+            .lock()
+            .unwrap()
+            .drain(..)
+            .for_each(Waker::wake);
+    }
+}
+
+// `do_work` takes a private lock, sleeps briefly, and releases it. A deadlock here shouldn't be
+// possible.
+async fn do_work() {
+    static LOCK: Lock<()> = Lock::new(());
+    let guard = LOCK.lock().await;
+    sleep(Duration::from_millis(10)).await;
+    // NOTE: The original `Merge` deadlock happens because the "losing" side of the `Merge` holds a
+    // place in the waiters queue. But the hacky `Lock` implementation above isn't "fair" and
+    // doesn't manage a queue. To make it possible for this version to deadlock -- for example if
+    // you put an early return in `Merge::poll_progress` or comment out the call to `poll_progress`
+    // in `ForEach::poll` -- we need to add an extra sleep here. This gives the losing side a
+    // chance to actually acquire the lock, before the `ForEach` body starts.
+    drop(guard);
+    sleep(Duration::from_millis(5)).await;
 }
 
 #[tokio::main]
 async fn main() {
-    println!("--- first loop ---");
-    // for await _ in print_numbers() {
-    //     sleep(Duration::from_millis(10)).await;
-    //     break;
-    // }
-    print_numbers()
-        .try_for_each(async |_| {
-            sleep(Duration::from_millis(10)).await;
-            ControlFlow::Break
-        })
-        .await;
-
-    println!("\n---second loop ---");
-    // for await _ in print_numbers().merge(print_numbers()) {
-    //     sleep(Duration::from_millis(10)).await;
-    //     break;
-    // }
-    print_numbers()
-        .merge(print_numbers())
-        .try_for_each(async |_| {
-            sleep(Duration::from_millis(10)).await;
-            ControlFlow::Break
+    let my_iter = once(do_work()).merge(once(do_work()));
+    my_iter
+        .for_each(|_| async {
+            println!("We make it here...");
+            do_work().await;
+            println!("...and here too!");
         })
         .await;
 }
